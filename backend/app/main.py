@@ -1,0 +1,128 @@
+import os
+from pathlib import Path
+from typing import Generator, Optional
+
+from dotenv import load_dotenv
+from fastapi import Depends, FastAPI, HTTPException, Query
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
+from sqlalchemy.orm import Session
+
+from .crud import create_event, get_events
+from .alfaforex_sync import get_description_by_external_id, refresh_if_stale
+from .database import Base, SessionLocal, engine, ensure_sqlite_columns
+from .models import Event
+from .schemas import EventCreate, EventRead
+from .seed import seed_if_empty
+
+load_dotenv(Path(__file__).resolve().parent.parent / ".env")
+
+app = FastAPI(title="Economic Events API", version="0.4.0")
+
+default_origins = ["http://localhost:5173", "http://127.0.0.1:5173"]
+origins_env = (os.getenv("FRONTEND_ORIGINS") or "").strip()
+allow_origins = (
+    [x.strip() for x in origins_env.split(",") if x.strip()] if origins_env else default_origins
+)
+allow_origin_regex = (os.getenv("FRONTEND_ORIGIN_REGEX") or "").strip() or None
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=allow_origins,
+    allow_origin_regex=allow_origin_regex,
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+Base.metadata.create_all(bind=engine)
+ensure_sqlite_columns()
+
+
+def get_db() -> Generator[Session, None, None]:
+    db = SessionLocal()
+    try:
+        yield db
+    finally:
+        db.close()
+
+
+@app.on_event("startup")
+def startup_seed():
+    with SessionLocal() as db:
+        seed_if_empty(db)
+        try:
+            refresh_if_stale(db, force=True)
+        except Exception:
+            # External source might be temporarily unavailable during startup.
+            pass
+
+
+@app.get("/health")
+def health():
+    return {"status": "ok"}
+
+
+@app.get("/api/v1/openapi.json", include_in_schema=False)
+def openapi_schema_v1():
+    """Same JSON as /openapi.json, path aligned with trading-calendar docs style."""
+    return JSONResponse(app.openapi())
+
+
+@app.get("/events", response_model=list[EventRead])
+def list_events(
+    country: Optional[str] = Query(default=None),
+    regulator: Optional[str] = Query(default=None),
+    importance: Optional[str] = Query(default=None),
+    auto_refresh: bool = Query(default=True),
+    db: Session = Depends(get_db),
+):
+    if auto_refresh:
+        try:
+            refresh_if_stale(db)
+        except Exception:
+            # Keep API available even if external source is temporarily down.
+            pass
+    rows = get_events(db, country=country, regulator=regulator, importance=importance)
+    if not rows and auto_refresh:
+        try:
+            refresh_if_stale(db, force=True)
+            rows = get_events(db, country=country, regulator=regulator, importance=importance)
+        except Exception:
+            pass
+    return rows
+
+
+@app.post("/events", response_model=EventRead, status_code=201)
+def add_event(payload: EventCreate, db: Session = Depends(get_db)):
+    return create_event(db, payload)
+
+
+@app.post("/events/refresh")
+def refresh_events(db: Session = Depends(get_db)):
+    try:
+        result = refresh_if_stale(db, force=True)
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"Failed to refresh from AlfaForex HTML: {e}") from e
+    return result or {"status": "ok"}
+
+
+@app.get("/events/{event_id}/description")
+def event_description(event_id: int, lang: str = Query(default="ru"), db: Session = Depends(get_db)):
+    row = db.get(Event, event_id)
+    if not row:
+        raise HTTPException(status_code=404, detail="Event not found")
+
+    fallback = row.description or ""
+    # For non-AlfaForex/manual events we only have stored description.
+    if row.source != "alfaforex" or not row.external_id:
+        return {"description": fallback}
+
+    if (lang or "").lower() == "ru":
+        return {"description": fallback}
+
+    try:
+        translated = get_description_by_external_id(row.external_id, lang=lang)
+    except Exception:
+        translated = None
+    return {"description": translated or fallback}
