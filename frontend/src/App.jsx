@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useState } from "react";
-import { BrowserRouter, Link, NavLink, Route, Routes } from "react-router-dom";
+import { BrowserRouter, HashRouter, Link, NavLink, Route, Routes } from "react-router-dom";
 import { fetchEventDescription, fetchEvents, refreshEvents } from "./api";
 import { useI18n } from "./i18n/I18nContext";
 import "./styles.css";
@@ -625,9 +625,11 @@ function Layout() {
 }
 
 export default function App() {
+  const Router =
+    typeof window !== "undefined" && window.location.hostname.endsWith("github.io") ? HashRouter : BrowserRouter;
   return (
-    <BrowserRouter>
+    <Router>
       <Layout />
-    </BrowserRouter>
+    </Router>
   );
 }
